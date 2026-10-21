@@ -1,0 +1,85 @@
+# Keeps amux's patch on rustls's newest 0.23 release: every day, if rustls
+# has tagged a newer v/0.23.* than the newest amux/<version> branch here,
+# the patch's commits are replayed onto that tag, rustls's tests run, and
+# amux/<version> is pushed. A conflict or a failing test opens an issue
+# here instead. The amux repository notices new amux/* branches on its own.
+name: follow rustls releases
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find rustls's newest release and the newest patched one
+        id: find
+        run: |
+          git remote add upstream https://github.com/rustls/rustls.git
+          git fetch --quiet --no-tags upstream '+refs/tags/v/0.23.*:refs/tags/v/0.23.*'
+          git fetch --quiet origin '+refs/heads/amux/*:refs/remotes/origin/amux/*'
+          latest=$(git tag --list 'v/0.23.*' | sed 's|^v/||' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          patched=$(git branch --remotes --list 'origin/amux/*' | sed 's|.*origin/amux/||' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          newest=$(printf '%s\n%s\n' "$latest" "$patched" | sort -V | tail -n 1)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "patched=$patched" >> "$GITHUB_OUTPUT"
+          if [ -n "$latest" ] && [ -n "$patched" ] && [ "$latest" != "$patched" ] && [ "$newest" = "$latest" ]; then
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "rustls v/$latest, patched $patched"
+
+      - name: Replay the patch onto the newest release
+        if: steps.find.outputs.behind == 'true'
+        env:
+          LATEST: ${{ steps.find.outputs.latest }}
+          PATCHED: ${{ steps.find.outputs.patched }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          base=$(git show "origin/amux/$PATCHED:.amux-base")
+          git checkout --quiet -b "amux/$LATEST" "v/$LATEST"
+          # Every commit of the patch but the ones that only name its base.
+          for commit in $(git rev-list --reverse "$base..origin/amux/$PATCHED"); do
+            if [ "$(git diff-tree --no-commit-id --name-only -r "$commit")" = ".amux-base" ]; then
+              continue
+            fi
+            git cherry-pick "$commit"
+          done
+          echo "v/$LATEST" > .amux-base
+          git add .amux-base
+          git commit --quiet -m "Name the rustls release the amux patch sits on"
+
+      - name: Test rustls with the patch
+        if: steps.find.outputs.behind == 'true'
+        run: cargo test -p rustls
+
+      - name: Publish the patched release
+        if: steps.find.outputs.behind == 'true'
+        env:
+          LATEST: ${{ steps.find.outputs.latest }}
+        run: git push origin "amux/$LATEST"
+
+      - name: Say the patch did not follow
+        if: failure() && steps.find.outputs.behind == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.find.outputs.latest }}
+          PATCHED: ${{ steps.find.outputs.patched }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="The amux patch does not follow rustls $LATEST"
+          if [ -n "$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+            exit 0
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+            --body "Replaying amux/$PATCHED onto v/$LATEST failed (a conflict or a failing test): $RUN. Rebase the patch by hand onto v/$LATEST and push it as amux/$LATEST."
