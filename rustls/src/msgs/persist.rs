@@ -4,9 +4,9 @@ use core::{cmp, fmt};
 use pki_types::{DnsName, UnixTime};
 use zeroize::Zeroizing;
 
-use crate::client::ResolvesClientCert;
+use crate::client::{ClientConfig, ResolvesClientCert};
 use crate::enums::{CipherSuite, ProtocolVersion};
-use crate::error::InvalidMessage;
+use crate::error::{Error, InvalidMessage};
 use crate::msgs::base::{MaybeEmpty, PayloadU8, PayloadU16};
 use crate::msgs::codec::{Codec, Reader};
 #[cfg(feature = "tls12")]
@@ -108,6 +108,74 @@ impl Tls13ClientSessionValue {
             ),
             quic_params: PayloadU16::new(Vec::new()),
         }
+    }
+
+    /// Encodes this ticket so a later process can resume with it.
+    ///
+    /// The encoding holds the session's resumption secret: keep it as
+    /// private as a key. A TLS 1.3 ticket is single-use, so decode each
+    /// encoding once.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.suite
+            .common
+            .suite
+            .encode(&mut bytes);
+        self.age_add.encode(&mut bytes);
+        self.max_early_data_size
+            .encode(&mut bytes);
+        self.quic_params.encode(&mut bytes);
+        let common = &self.common;
+        common.ticket.encode(&mut bytes);
+        common.secret.encode(&mut bytes);
+        common.epoch.encode(&mut bytes);
+        common.lifetime_secs.encode(&mut bytes);
+        common
+            .server_cert_chain
+            .encode(&mut bytes);
+        bytes
+    }
+
+    /// Decodes a ticket [`Self::encode`] wrote, to resume under `config`.
+    ///
+    /// The ticket is bound to `config`'s server certificate verifier and
+    /// client certificate resolver, as if `config` had been given it, since
+    /// a ticket resumes only under the configuration it was issued to. A
+    /// resumed handshake does not verify the server's certificate again:
+    /// give a ticket only to a configuration that trusts the server it came
+    /// from.
+    pub fn from_slice(bytes: &[u8], config: &ClientConfig) -> Result<Self, Error> {
+        let mut reader = Reader::init(bytes);
+        let suite = CipherSuite::read(&mut reader)?;
+        let suite = config
+            .crypto_provider()
+            .cipher_suites
+            .iter()
+            .filter_map(|offered| offered.tls13())
+            .find(|offered| offered.common.suite == suite)
+            .ok_or(Error::General(
+                "the ticket's cipher suite is not offered".into(),
+            ))?;
+        let age_add = u32::read(&mut reader)?;
+        let max_early_data_size = u32::read(&mut reader)?;
+        let quic_params = PayloadU16::read(&mut reader)?;
+        let common = ClientSessionCommon {
+            ticket: Arc::new(PayloadU16::read(&mut reader)?),
+            secret: Zeroizing::new(PayloadU8::read(&mut reader)?),
+            epoch: u64::read(&mut reader)?,
+            lifetime_secs: cmp::min(u32::read(&mut reader)?, MAX_TICKET_LIFETIME),
+            server_cert_chain: Arc::new(CertificateChain::read(&mut reader)?.into_owned()),
+            server_cert_verifier: Arc::downgrade(&config.verifier),
+            client_creds: Arc::downgrade(&config.client_auth_cert_resolver),
+        };
+        reader.expect_empty("Tls13ClientSessionValue")?;
+        Ok(Self {
+            suite,
+            age_add,
+            max_early_data_size,
+            common,
+            quic_params,
+        })
     }
 
     pub fn max_early_data_size(&self) -> u32 {

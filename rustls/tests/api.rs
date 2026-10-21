@@ -5215,6 +5215,121 @@ fn tls13_stateful_resumption() {
     assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
 }
 
+/// A TLS 1.3 ticket encoded as it is stored and decoded under a new
+/// client configuration, as a new process would, resumes the session.
+#[test]
+fn tls13_ticket_resumes_after_encoding_under_a_new_config() {
+    #[derive(Debug)]
+    struct Saving {
+        inner: rustls::client::ClientSessionMemoryCache,
+        saved: Mutex<Vec<(ServerName<'static>, Vec<u8>)>>,
+    }
+
+    impl rustls::client::ClientSessionStore for Saving {
+        fn set_kx_hint(&self, server_name: ServerName<'static>, group: rustls::NamedGroup) {
+            self.inner
+                .set_kx_hint(server_name, group)
+        }
+
+        fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+            self.inner.kx_hint(server_name)
+        }
+
+        fn set_tls12_session(
+            &self,
+            server_name: ServerName<'static>,
+            value: rustls::client::Tls12ClientSessionValue,
+        ) {
+            self.inner
+                .set_tls12_session(server_name, value)
+        }
+
+        fn tls12_session(
+            &self,
+            server_name: &ServerName<'_>,
+        ) -> Option<rustls::client::Tls12ClientSessionValue> {
+            self.inner.tls12_session(server_name)
+        }
+
+        fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+            self.inner
+                .remove_tls12_session(server_name)
+        }
+
+        fn insert_tls13_ticket(
+            &self,
+            server_name: ServerName<'static>,
+            value: rustls::client::Tls13ClientSessionValue,
+        ) {
+            self.saved
+                .lock()
+                .unwrap()
+                .push((server_name.clone(), value.encode()));
+            self.inner
+                .insert_tls13_ticket(server_name, value)
+        }
+
+        fn take_tls13_ticket(
+            &self,
+            server_name: &ServerName<'static>,
+        ) -> Option<rustls::client::Tls13ClientSessionValue> {
+            self.inner
+                .take_tls13_ticket(server_name)
+        }
+    }
+
+    let kt = KeyType::Rsa2048;
+    let provider = provider::default_provider();
+    let client_with = |store: &Arc<Saving>| {
+        let mut config =
+            make_client_config_with_versions(kt, &[&rustls::version::TLS13], &provider);
+        config.resumption = Resumption::store(store.clone());
+        config
+    };
+    let saving = || {
+        Arc::new(Saving {
+            inner: rustls::client::ClientSessionMemoryCache::new(16),
+            saved: Mutex::new(Vec::new()),
+        })
+    };
+    let server_config = Arc::new(make_server_config(kt, &provider));
+
+    let first = saving();
+    let (mut client, mut server) =
+        make_pair_for_arc_configs(&Arc::new(client_with(&first)), &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    let saved = std::mem::take(&mut *first.saved.lock().unwrap());
+    assert!(!saved.is_empty());
+
+    // A new configuration resumes nothing on its own.
+    let (mut client, mut server) =
+        make_pair_for_arc_configs(&Arc::new(client_with(&saving())), &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    // With the saved tickets decoded under it, it resumes.
+    let second = saving();
+    let config = client_with(&second);
+    for (server_name, encoded) in saved {
+        let value = rustls::client::Tls13ClientSessionValue::from_slice(&encoded, &config).unwrap();
+        rustls::client::ClientSessionStore::insert_tls13_ticket(&second.inner, server_name, value);
+    }
+    let (mut client, mut server) = make_pair_for_arc_configs(&Arc::new(config), &server_config);
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+
+    assert!(
+        rustls::client::Tls13ClientSessionValue::from_slice(
+            &[0x13, 0x01, 0],
+            &client_with(&saving())
+        )
+        .is_err(),
+        "a truncated encoding is refused"
+    );
+}
+
 #[test]
 fn tls13_stateless_resumption() {
     let kt = KeyType::Rsa2048;

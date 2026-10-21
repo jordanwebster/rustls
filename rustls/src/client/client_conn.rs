@@ -253,7 +253,7 @@ pub struct ClientConfig {
     pub(super) versions: versions::EnabledVersions,
 
     /// How to verify the server certificate chain.
-    pub(super) verifier: Arc<dyn verify::ServerCertVerifier>,
+    pub(crate) verifier: Arc<dyn verify::ServerCertVerifier>,
 
     /// How to decompress the server's certificate chain.
     ///
