@@ -5153,6 +5153,84 @@ impl rustls::client::ClientSessionStore for ClientStorage {
 }
 
 #[test]
+fn tls13_stateful_ticket_lifetime_comes_from_the_session_store() {
+    #[derive(Debug)]
+    struct Kept(Arc<rustls::server::ServerSessionMemoryCache>, u32);
+
+    impl rustls::server::StoresServerSessions for Kept {
+        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+            self.0.put(key, value)
+        }
+
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key)
+        }
+
+        fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.take(key)
+        }
+
+        fn can_cache(&self) -> bool {
+            self.0.can_cache()
+        }
+
+        fn lifetime(&self) -> u32 {
+            self.1
+        }
+    }
+
+    /// The wall clock, moved forward by a number of seconds.
+    #[derive(Debug, Default)]
+    struct Later(std::sync::atomic::AtomicU64);
+
+    impl rustls::time_provider::TimeProvider for Later {
+        fn current_time(&self) -> Option<UnixTime> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            let later = std::time::Duration::from_secs(self.0.load(Ordering::SeqCst));
+            Some(UnixTime::since_unix_epoch(now + later))
+        }
+    }
+
+    fn resumes_after(lifetime: u32, later: u64) -> bool {
+        let kt = KeyType::Rsa2048;
+        let provider = provider::default_provider();
+        let clock = Arc::new(Later::default());
+
+        let mut client_config =
+            make_client_config_with_versions(kt, &[&rustls::version::TLS13], &provider);
+        client_config.time_provider = clock.clone();
+        let client_config = Arc::new(client_config);
+
+        let mut server_config = make_server_config(kt, &provider);
+        server_config.session_storage = Arc::new(Kept(
+            rustls::server::ServerSessionMemoryCache::new(8),
+            lifetime,
+        ));
+        server_config.time_provider = clock.clone();
+        let server_config = Arc::new(server_config);
+
+        let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+        do_handshake(&mut client, &mut server);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+        clock.0.store(later, Ordering::SeqCst);
+        let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+        do_handshake(&mut client, &mut server);
+        client.handshake_kind() == Some(HandshakeKind::Resumed)
+    }
+
+    const DAY: u32 = 24 * 60 * 60;
+    // A store keeping sessions a day, as the default advertises.
+    assert!(!resumes_after(DAY, 2 * u64::from(DAY)));
+    assert!(resumes_after(3 * DAY, 2 * u64::from(DAY)));
+    // Capped at the seven days RFC 8446 allows.
+    assert!(resumes_after(30 * DAY, 6 * u64::from(DAY)));
+    assert!(!resumes_after(30 * DAY, 8 * u64::from(DAY)));
+}
+
+#[test]
 fn tls13_stateful_resumption() {
     let kt = KeyType::Rsa2048;
     let provider = provider::default_provider();

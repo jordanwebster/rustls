@@ -77,6 +77,17 @@ pub trait StoresServerSessions: Debug + Send + Sync {
     /// whether their session can be resumed; the implementation is not required to remember
     /// a session even if it returns `true` here.
     fn can_cache(&self) -> bool;
+
+    /// The lifetime in seconds to advertise for TLS 1.3 tickets naming
+    /// sessions in this store.
+    ///
+    /// Clients use it as a hint that the ticket will not be useful after
+    /// that time, so it should match how long the store actually keeps a
+    /// session. Values above the seven days RFC 8446 section 4.6.1 allows
+    /// are capped. The default is one day.
+    fn lifetime(&self) -> u32 {
+        24 * 60 * 60
+    }
 }
 
 /// A trait for the ability to encrypt and decrypt tickets.

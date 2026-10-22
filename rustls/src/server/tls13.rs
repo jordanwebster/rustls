@@ -1356,7 +1356,11 @@ impl ExpectFinished {
                 trace!("resumption not available; not issuing ticket");
                 return Ok(());
             }
-            let stateful_lifetime = 24 * 60 * 60; // this is a bit of a punt
+            // RFC 8446 section 4.6.1: no more than seven days.
+            let stateful_lifetime = config
+                .session_storage
+                .lifetime()
+                .min(7 * 24 * 60 * 60);
             (id, stateful_lifetime)
         };
 
